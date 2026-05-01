@@ -30,6 +30,7 @@ Request flow for a typical call:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -39,7 +40,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from app.config import get_settings
 from app.llm_provider import get_llm_provider, reset_provider
@@ -51,9 +52,7 @@ from app.schemas import (
     LLMResponse,
     ProviderConfig,
     ProviderInfoResponse,
-    VobizAnswerWebhook,
-    VobizHangupWebhook,
-    VobizRecordingWebhook,
+
     WebhookResponse,
 )
 from app.state_machine import build_system_prompt, determine_next_state
@@ -145,6 +144,49 @@ if INTEGRATIONS_AVAILABLE:
 # ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
+
+def _absolute_audio_url(request: Request, relative_path: str) -> str:
+    """Convert a relative /audio/ path to an absolute HTTPS URL.
+
+    When the request comes through ngrok, request.base_url is 'http://'
+    because the ngrok→localhost hop is HTTP. We detect the real public
+    host from X-Forwarded-Host / X-Forwarded-Proto headers and rewrite
+    the URL to HTTPS so Vobiz can fetch it.
+    """
+    # Check for forwarded headers (ngrok, Cloudflare, etc.)
+    forwarded_proto = request.headers.get("x-forwarded-proto", "")
+    forwarded_host = request.headers.get("x-forwarded-host", "") or request.headers.get("host", "")
+
+    if forwarded_proto and forwarded_host:
+        base = f"{forwarded_proto}://{forwarded_host}"
+    else:
+        base = str(request.base_url).rstrip("/")
+
+    return f"{base}{relative_path}"
+
+
+def _vobiz_xml(text: str = "", audio_url: str = "", hangup: bool = False, record_url: str = "") -> str:
+    """Build a Vobiz-compatible XML response.
+
+    Vobiz XML Applications expect Plivo/Exotel-style XML.
+    We return <Speak> for text or <Play> for pre-generated audio.
+    <Record> captures user speech and sends it to the recording webhook.
+    """
+    lines = ['<?xml version="1.0" encoding="UTF-8"?>', "<Response>"]
+    if audio_url:
+        lines.append(f"    <Play>{audio_url}</Play>")
+    elif text:
+        # Escape XML special chars in text
+        safe_text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        lines.append(f"    <Speak>{safe_text}</Speak>")
+    if record_url and not hangup:
+        # Capture user speech and POST it to the recording webhook
+        lines.append(f'    <Record action="{record_url}" method="POST" maxLength="15" timeout="3" playBeep="true" finishOnKey="#" />')
+    if hangup:
+        lines.append("    <Hangup/>")
+    lines.append("</Response>")
+    return "\n".join(lines)
+
 
 async def _store_audio_file(call_sid: str, audio_bytes: bytes) -> str:
     """Save TTS audio to a local file and return a URL.
@@ -267,24 +309,62 @@ async def switch_provider(config: ProviderConfig) -> Dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Vobiz Webhooks
+# Vobiz Webhooks  (raw dict parsing — no Pydantic validation for compatibility)
 # ---------------------------------------------------------------------------
 
-@app.post("/webhook/vobiz/answer", response_model=WebhookResponse)
-async def webhook_answer(payload: VobizAnswerWebhook) -> Dict[str, Any]:
+def _get_field(data: Dict[str, Any], *names: str) -> Any:
+    """Get first matching field from dict (case-insensitive)."""
+    for name in names:
+        if name in data:
+            return data[name]
+        for k, v in data.items():
+            if k.lower() == name.lower():
+                return v
+    return None
+
+
+async def _parse_request_body(request: Request) -> Dict[str, Any]:
+    """Parse request body as JSON or form data. Returns empty dict on failure.
+
+    Vobiz sends webhooks as form-encoded POST data by default, not JSON.
+    This helper tries JSON first, then falls back to form data, then query params.
+    """
+    data: Dict[str, Any] = dict(request.query_params)
+
+    try:
+        json_data = await request.json()
+        if isinstance(json_data, dict):
+            data.update(json_data)
+        return data
+    except Exception:
+        try:
+            form_data = await request.form()
+            data.update(dict(form_data))
+            return data
+        except Exception:
+            return data
+
+
+@app.post("/webhook/vobiz/answer")
+@app.get("/webhook/vobiz/answer")
+async def webhook_answer(request: Request):
     """Handle 'call answered' event from Vobiz.
 
-    This is the entry point for every call. We:
-        1. Create a new CallSession in Redis/memory
-        2. Generate an opening greeting via LLM
-        3. Convert the greeting to speech via TTS
-        4. Return the audio URL to Vobiz
-
-    Idempotent: if called again with the same call_sid, it returns
-    the same greeting (doesn't create duplicate sessions).
+    Accepts ANY JSON payload — no Pydantic validation so Vobiz can't 422 us.
+    Returns Plivo/Exotel-style XML.
     """
-    call_sid = payload.call_sid
-    logger.info("[call:%s] Call answered from %s", call_sid, payload.from_number)
+    data = await _parse_request_body(request)
+    call_sid = _get_field(data, "call_sid", "CallSid", "callSid", "request_uuid", "RequestUUID") or ""
+    from_number = _get_field(data, "from", "From", "from_number", "FromNumber", "caller_id", "CallerID") or ""
+
+    if not call_sid:
+        logger.info("Vobiz URL test ping on /webhook/vobiz/answer — payload: %s", data)
+        return PlainTextResponse(
+            _vobiz_xml(text="OK"),
+            media_type="application/xml",
+        )
+
+    logger.info("[call:%s] Call answered from %s", call_sid, from_number)
 
     # Check for existing session (idempotency)
     existing = await _memory.get_session(call_sid)
@@ -293,12 +373,15 @@ async def webhook_answer(payload: VobizAnswerWebhook) -> Dict[str, Any]:
         turns = existing.get("turns", [])
         for turn in turns:
             if turn.get("role") == "assistant":
-                return {"text": turn["content"], "state": existing.get("state")}
+                return PlainTextResponse(
+                    _vobiz_xml(text=turn["content"]),
+                    media_type="application/xml",
+                )
 
     # --- 1. Create new session ---
     session: Dict[str, Any] = {
         "call_sid": call_sid,
-        "lead_phone": payload.from_number,
+        "lead_phone": from_number,
         "state": "opening",
         "turns": [],
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -312,67 +395,38 @@ async def webhook_answer(payload: VobizAnswerWebhook) -> Dict[str, Any]:
     }
     await _memory.save_session(call_sid, session)
 
-    # --- 2. Generate opening greeting via LLM ---
+    # --- 2. Return INSTANT greeting (skip slow LLM+TTS to avoid Vobiz timeout) ---
+    # The recording webhook will handle LLM+TTS for subsequent turns.
     settings = get_settings()
-    provider = get_llm_provider()
-    system_prompt = build_system_prompt(
-        "opening",
-        settings.BATTLE_CARD_TEXT or "",
+    greeting = f"Hello! This is {settings.BUSINESS_NAME or 'your coaching assistant'}. How can I help you today?"
+    await _memory.add_turn(call_sid, "assistant", greeting)
+
+    logger.info("[call:%s] Sent instant greeting (bypass LLM/TTS for answer webhook)", call_sid)
+    record_url = _absolute_audio_url(request, "/webhook/vobiz/recording")
+    return PlainTextResponse(
+        _vobiz_xml(text=greeting, record_url=record_url),
+        media_type="application/xml",
     )
 
-    try:
-        llm_resp = await provider.generate(
-            messages=[],
-            system=system_prompt,
-        )
-    except Exception as exc:
-        logger.error("[call:%s] LLM error in answer webhook: %s", call_sid, exc)
-        return {
-            "text": f"Namaste! Main {settings.BUSINESS_NAME or 'aapki help'} se baat kar raha hoon. Aap kaise madad kar sakta hoon aaj?",
-            "state": "opening",
-        }
 
-    ai_text = llm_resp.text or "Namaste! Main aapki kaise madad kar sakta hoon?"
-
-    # Update session with LLM metadata
-    session["llm_model"] = llm_resp.model
-    session["total_llm_calls"] = 1
-    session["total_tokens_used"] = llm_resp.tokens_used
-    await _memory.save_session(call_sid, session)
-
-    # --- 3. Convert to speech ---
-    audio_bytes = await sarvam_tts(ai_text)
-    if audio_bytes:
-        audio_url = await _store_audio_file(call_sid, audio_bytes)
-        return {
-            "audio_url": audio_url,
-            "text": ai_text,
-            "state": "opening",
-        }
-    else:
-        logger.warning("[call:%s] TTS failed -- returning text fallback", call_sid)
-        return {
-            "text": ai_text,
-            "state": "opening",
-        }
-
-
-@app.post("/webhook/vobiz/recording", response_model=WebhookResponse)
-async def webhook_recording(payload: VobizRecordingWebhook) -> Dict[str, Any]:
+@app.post("/webhook/vobiz/recording")
+@app.get("/webhook/vobiz/recording")
+async def webhook_recording(request: Request):
     """Handle 'recording completed' event from Vobiz.
 
-    This is the core conversation loop -- it runs on every user utterance:
-        1. Get session from memory
-        2. Get user's text (STT if needed, or use provided text)
-        3. Add user turn to history
-        4. Determine next state via state machine
-        5. Build system prompt for that state
-        6. Call LLM with conversation history
-        7. Add AI turn to history
-        8. Convert AI text to speech (TTS)
-        9. Return audio URL
+    Accepts ANY JSON payload — no Pydantic validation so Vobiz can't 422 us.
+    Returns Plivo/Exotel-style XML.
     """
-    call_sid = payload.call_sid
+    data = await _parse_request_body(request)
+    call_sid = _get_field(data, "call_sid", "CallSid", "callSid", "request_uuid", "RequestUUID") or ""
+
+    if not call_sid:
+        logger.info("Vobiz URL test ping on /webhook/vobiz/recording — payload: %s", data)
+        return PlainTextResponse(
+            _vobiz_xml(text="OK"),
+            media_type="application/xml",
+        )
+
     logger.info("[call:%s] Recording received", call_sid)
 
     # --- 1. Get session ---
@@ -395,25 +449,44 @@ async def webhook_recording(payload: VobizRecordingWebhook) -> Dict[str, Any]:
         }
 
     # --- 2. Get user text ---
+    # Log full payload so we can see exactly what Vobiz sends
+    logger.info("[call:%s] Recording webhook payload keys: %s", call_sid, list(data.keys()))
+    logger.debug("[call:%s] Recording webhook full payload: %s", call_sid, data)
+
+    user_text_raw = _get_field(data, "user_text", "UserText", "transcription", "Transcription", "text", "Text", "speech", "Speech", "message", "Message")
+    recording_url = _get_field(data, "recording_url", "RecordingUrl", "recordingUrl", "record_url", "RecordUrl", "recordUrl", "url", "Url", "media_url", "MediaUrl", "audio_url", "AudioUrl")
+
     user_text = ""
-    if payload.user_text:
-        user_text = payload.user_text.strip()
+    if user_text_raw:
+        user_text = str(user_text_raw).strip()
         logger.info("[call:%s] Using provided transcription: %r", call_sid, user_text[:80])
-    elif payload.recording_url:
-        logger.info("[call:%s] Running STT on %s", call_sid, payload.recording_url)
-        user_text = await sarvam_stt(payload.recording_url)
+    elif recording_url:
+        logger.info("[call:%s] Running STT on %s", call_sid, recording_url)
+        # Vobiz recording URLs require authentication
+        download_headers = None
+        if "vobiz" in str(recording_url).lower():
+            download_headers = {
+                "X-Auth-ID": get_settings().VOBIZ_AUTH_ID,
+                "X-Auth-Token": get_settings().VOBIZ_AUTH_TOKEN,
+            }
+            logger.debug("[call:%s] Adding Vobiz auth headers for download", call_sid)
+        user_text = await sarvam_stt(str(recording_url), download_headers=download_headers)
         logger.info("[call:%s] STT result: %r", call_sid, user_text[:80] if user_text else "(empty)")
     else:
         logger.warning("[call:%s] No audio URL or text provided", call_sid)
-        return {"text": "Maine aapki awaaz nahi suni. Kripya dobara boliye.", "state": session.get("state")}
+        record_url = _absolute_audio_url(request, "/webhook/vobiz/recording")
+        return PlainTextResponse(
+            _vobiz_xml(text="Sorry, I didn't catch that. Could you please speak a bit more clearly?", record_url=record_url),
+            media_type="application/xml",
+        )
 
     if not user_text:
-        repeat_msg = "Maaf kijiye, main samajh nahi paaya. Kripya thoda saaf boliye."
-        audio_bytes = await sarvam_tts(repeat_msg)
-        if audio_bytes:
-            audio_url = await _store_audio_file(call_sid, audio_bytes)
-            return {"audio_url": audio_url, "text": repeat_msg, "state": session.get("state")}
-        return {"text": repeat_msg, "state": session.get("state")}
+        repeat_msg = "Sorry, I didn't catch that. Could you please speak a bit more clearly?"
+        record_url = _absolute_audio_url(request, "/webhook/vobiz/recording")
+        return PlainTextResponse(
+            _vobiz_xml(text=repeat_msg, record_url=record_url),
+            media_type="application/xml",
+        )
 
     # --- 3. Add user turn ---
     await _memory.add_turn(call_sid, "user", user_text)
@@ -441,12 +514,12 @@ async def webhook_recording(payload: VobizRecordingWebhook) -> Dict[str, Any]:
         )
     except Exception as exc:
         logger.error("[call:%s] LLM error: %s", call_sid, exc)
-        error_msg = "Maaf kijiye, kuch technical issue aa gaya. Thodi der mein try kijiye."
-        audio_bytes = await sarvam_tts(error_msg)
-        if audio_bytes:
-            audio_url = await _store_audio_file(call_sid, audio_bytes)
-            return {"audio_url": audio_url, "text": error_msg, "state": next_state}
-        return {"text": error_msg, "state": next_state}
+        error_msg = "Sorry, we seem to be facing a technical issue. Please try again in a moment."
+        record_url = _absolute_audio_url(request, "/webhook/vobiz/recording")
+        return PlainTextResponse(
+            _vobiz_xml(text=error_msg, record_url=record_url),
+            media_type="application/xml",
+        )
 
     ai_text = llm_resp.text or "Main samajh nahi paaya. Kripya dobara boliye."
 
@@ -461,40 +534,46 @@ async def webhook_recording(payload: VobizRecordingWebhook) -> Dict[str, Any]:
         session["total_tokens_used"] = session.get("total_tokens_used", 0) + llm_resp.tokens_used
         await _memory.save_session(call_sid, session)
 
-    # --- 8. TTS ---
-    audio_bytes = await sarvam_tts(ai_text)
-    if audio_bytes:
-        audio_url = await _store_audio_file(call_sid, audio_bytes)
-        return {
-            "audio_url": audio_url,
-            "text": ai_text,
-            "state": next_state,
-            "hangup": next_state == "ended",
-        }
-    else:
-        return {
-            "text": ai_text,
-            "state": next_state,
-            "hangup": next_state == "ended",
-        }
+    # --- 8. Return AI response (skip TTS to keep latency low) ---
+    # Vobiz will use its own TTS engine to speak the text.
+    # This saves ~1.5s per turn vs calling Sarvam TTS.
+    record_url = _absolute_audio_url(request, "/webhook/vobiz/recording")
+    logger.info("[call:%s] Returning text response (%d chars)", call_sid, len(ai_text))
+    return PlainTextResponse(
+        _vobiz_xml(text=ai_text, hangup=(next_state == "ended"), record_url=record_url),
+        media_type="application/xml",
+    )
 
 
 @app.post("/webhook/vobiz/hangup")
-async def webhook_hangup(payload: VobizHangupWebhook) -> Dict[str, str]:
+@app.get("/webhook/vobiz/hangup")
+async def webhook_hangup(request: Request):
     """Handle 'call ended' event from Vobiz.
 
-    Marks the session as ended and sets a short TTL so the call
-    data is available for post-call analytics briefly, then auto-cleaned.
+    Accepts ANY JSON payload — no Pydantic validation so Vobiz can't 422 us.
     """
-    call_sid = payload.call_sid
+    data = await _parse_request_body(request)
+    call_sid = _get_field(data, "call_sid", "CallSid", "callSid", "request_uuid", "RequestUUID") or ""
+    duration = _get_field(data, "duration_seconds", "Duration", "call_duration") or 0
+
+    if not call_sid:
+        logger.info("Vobiz URL test ping on /webhook/vobiz/hangup — payload: %s", data)
+        return PlainTextResponse(
+            _vobiz_xml(),
+            media_type="application/xml",
+        )
+
     logger.info(
         "[call:%s] Call ended. Duration: %ss",
         call_sid,
-        payload.duration_seconds,
+        duration,
     )
 
     await _memory.end_session(call_sid)
-    return {"status": "ok", "call_sid": call_sid}
+    return PlainTextResponse(
+        _vobiz_xml(),
+        media_type="application/xml",
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -119,11 +119,12 @@ class VobizAnswerWebhook(BaseModel):
     """Payload sent by Vobiz when a call is first answered.
 
     This is the entry point — it creates a new CallSession.
+    Fields are optional to survive Vobiz dashboard URL test pings.
     """
-    event: str = Field(default="call.answered", description="Event type")
-    call_sid: str = Field(..., description="Unique call identifier")
-    from_number: str = Field(..., alias="from", description="Caller phone number")
-    to_number: str = Field(..., alias="to", description="Dialed number")
+    event: Optional[str] = Field(default="call.answered", description="Event type")
+    call_sid: Optional[str] = Field(default="", description="Unique call identifier")
+    from_number: Optional[str] = Field(default="", alias="from", description="Caller phone number")
+    to_number: Optional[str] = Field(default="", alias="to", description="Dialed number")
     timestamp: Optional[datetime] = Field(
         default=None,
         description="When the event occurred (Vobix-provided)",
@@ -137,9 +138,10 @@ class VobizRecordingWebhook(BaseModel):
 
     Contains either a pre-transcribed text (for testing/vendors that
     handle STT) or an audio_url that we need to send to Sarvam STT.
+    Fields are optional to survive Vobiz dashboard URL test pings.
     """
-    event: str = Field(default="recording.completed", description="Event type")
-    call_sid: str = Field(..., description="Call this recording belongs to")
+    event: Optional[str] = Field(default="recording.completed", description="Event type")
+    call_sid: Optional[str] = Field(default="", description="Call this recording belongs to")
     recording_url: Optional[str] = Field(
         default=None,
         description="URL to the audio file (needs STT)",
@@ -159,9 +161,10 @@ class VobizHangupWebhook(BaseModel):
     """Payload sent by Vobiz when the call ends (caller hangs up or timeout).
 
     Triggers session cleanup and analytics logging.
+    Fields are optional to survive Vobiz dashboard URL test pings.
     """
-    event: str = Field(default="call.hangup", description="Event type")
-    call_sid: str = Field(..., description="Call that ended")
+    event: Optional[str] = Field(default="call.hangup", description="Event type")
+    call_sid: Optional[str] = Field(default="", description="Call that ended")
     duration_seconds: Optional[int] = Field(
         default=None,
         description="Total call duration",

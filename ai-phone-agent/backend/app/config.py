@@ -30,15 +30,16 @@ class Settings:
     DEBUG: bool = os.getenv("DEBUG", "false").lower() == "true"
 
     # --- Vobiz Telephony ---
-    VOBIZ_API_KEY: str = os.getenv("VOBIZ_API_KEY", "")
-    VOBIZ_BASE_URL: str = os.getenv("VOBIZ_BASE_URL", "https://api.vobiz.com/v1")
+    VOBIZ_AUTH_ID: str = os.getenv("VOBIZ_AUTH_ID", "")
+    VOBIZ_AUTH_TOKEN: str = os.getenv("VOBIZ_AUTH_TOKEN", "")
+    VOBIZ_BASE_URL: str = os.getenv("VOBIZ_BASE_URL", "https://api.vobiz.ai/api/v1")
 
     # --- Sarvam AI (Voice STT/TTS) ---
     SARVAM_API_KEY: str = os.getenv("SARVAM_API_KEY", "")
-    SARVAM_BASE_URL: str = os.getenv("SARVAM_BASE_URL", "https://api.sarvam.ai/v1")
+    SARVAM_BASE_URL: str = os.getenv("SARVAM_BASE_URL", "https://api.sarvam.ai")
 
     # --- LLM Provider Selection ---
-    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "groq").lower()
+    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "anthropic").lower()
 
     # --- Groq ---
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
@@ -54,7 +55,7 @@ class Settings:
 
     # --- Anthropic ---
     ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
-    ANTHROPIC_MODEL: str = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+    ANTHROPIC_MODEL: str = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
     ANTHROPIC_TEMPERATURE: float = float(os.getenv("ANTHROPIC_TEMPERATURE", "0.7"))
     ANTHROPIC_MAX_TOKENS: int = int(os.getenv("ANTHROPIC_MAX_TOKENS", "512"))
 
@@ -68,10 +69,15 @@ class Settings:
     REDIS_URL: Optional[str] = os.getenv("REDIS_URL") or None
     SESSION_TTL_SECONDS: int = int(os.getenv("SESSION_TTL_SECONDS", "86400"))
 
+    # --- Cal.com ---
+    CAL_API_KEY: str = os.getenv("CAL_API_KEY", "")
+    CAL_USERNAME: str = os.getenv("CAL_USERNAME", "")
+    CAL_EVENT_SLUG: str = os.getenv("CAL_EVENT_SLUG", "")
+
     # --- Business Context (injected into prompts) ---
     BUSINESS_NAME: str = os.getenv("BUSINESS_NAME", "Your Business")
     BUSINESS_TYPE: str = os.getenv("BUSINESS_TYPE", "coaching")
-    AGENT_LANGUAGE: str = os.getenv("AGENT_LANGUAGE", "hi-IN")
+    AGENT_LANGUAGE: str = os.getenv("AGENT_LANGUAGE", "en-IN")
     BATTLE_CARD_TEXT: str = os.getenv(
         "BATTLE_CARD_TEXT",
         "You are a helpful phone assistant for a coaching business.",
@@ -120,7 +126,7 @@ class Settings:
                 "timeout_seconds": 30,
             },
         }
-        return configs.get(provider_name, configs["groq"])
+        return configs.get(provider_name, configs["anthropic"])
 
 
 @lru_cache()

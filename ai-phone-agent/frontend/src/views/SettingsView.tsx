@@ -310,7 +310,7 @@ export default function SettingsView() {
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-5">
               {([
-                { key: 'business_name', label: 'Business Name', placeholder: 'Acme Coaching' },
+                { key: 'business_name', label: 'Business Name', placeholder: 'Hamza Coaching' },
                 { key: 'owner_name', label: 'Owner Name', placeholder: 'John Doe' },
                 { key: 'pricing', label: 'Pricing', placeholder: 'Rs 25,000 for 8 sessions' },
                 { key: 'session_duration', label: 'Session Duration', placeholder: '60 minutes' },

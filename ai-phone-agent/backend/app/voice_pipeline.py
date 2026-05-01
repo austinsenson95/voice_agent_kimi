@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 # STT: Speech-to-Text
 # ---------------------------------------------------------------------------
 
-async def sarvam_stt(audio_url: str) -> str:
+async def sarvam_stt(audio_url: str, download_headers: Optional[Dict[str, str]] = None) -> str:
     """Download audio from URL and transcribe using Sarvam STT (saarika:v2).
 
     This function performs two HTTP requests:
@@ -57,7 +57,7 @@ async def sarvam_stt(audio_url: str) -> str:
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             logger.debug("Downloading audio from %s", audio_url)
-            audio_resp = await client.get(audio_url)
+            audio_resp = await client.get(audio_url, headers=download_headers)
             audio_resp.raise_for_status()
             audio_bytes = audio_resp.content
             logger.debug("Downloaded %d bytes of audio", len(audio_bytes))
@@ -83,7 +83,7 @@ async def sarvam_stt(audio_url: str) -> str:
                 "file": ("recording.wav", audio_bytes, "audio/wav"),
             }
             data = {
-                "model": "saarika:v2",
+                "model": "saarika:v2.5",
                 "language_code": settings.AGENT_LANGUAGE,  # e.g. "hi-IN"
                 "with_timestamps": "false",
             }
@@ -166,9 +166,9 @@ async def sarvam_tts(text: str) -> Optional[bytes]:
 
     payload = {
         "inputs": [text],
-        "target_language_code": settings.AGENT_LANGUAGE,  # e.g. "hi-IN"
-        "speaker": "meera",  # Female Indian voice — natural for coaching
-        "model": "bulbul:v1",
+        "target_language_code": settings.AGENT_LANGUAGE,  # e.g. "en-IN"
+        "speaker": "arya",  # Indian English female voice
+        "model": "bulbul:v2",
         "pitch": 0.0,
         "pace": 1.0,
         "loudness": 1.0,

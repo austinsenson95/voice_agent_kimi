@@ -1,57 +1,31 @@
 """Cal.com REST API integration for the AI Phone Agent.
 
-Provides async functions to:
-
-* Check availability for a given date / event type.
-* Create bookings with caller details.
-* Cancel existing bookings by UID.
-* Format available slots into natural speech for TTS (text-to-speech).
+Uses Cal.com API v2 for bookings and cancellations.
+Availability checking falls back to sensible defaults because the
+``/v2/slots`` endpoint is not yet available for legacy ``cal_live_*`` keys.
 
 All network calls use ``httpx.AsyncClient`` with sensible timeouts and
 graceful error handling. Timezone handling is hard-coded to **Asia/Kolkata**
 (IST, UTC+5:30) since the MVP targets Indian businesses.
-
-Environment variables required::
-
-    CAL_API_KEY         — Cal.com API key
-    CAL_EVENT_TYPE_ID   — Numeric event-type ID for the coaching session
-    CAL_API_VERSION     — API version prefix (default: "v1")
-
-Usage::
-
-    from app.calendar import check_availability, create_booking, format_slots_for_tts
-
-    slots = await check_availability("2024-01-15")
-    speech = format_slots_for_tts(slots)
-    # Pass *speech* to the TTS engine.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 from datetime import date, datetime, timedelta, timezone
-from typing import Any
+from typing import Any, List
 
 import httpx
+
+from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration (pulled from centralized config.py)
 # ---------------------------------------------------------------------------
-
-_CAL_API_KEY = os.getenv("CAL_API_KEY", "")
-_CAL_EVENT_TYPE_ID = int(os.getenv("CAL_EVENT_TYPE_ID", "0"))
-_CAL_API_VERSION = os.getenv("CAL_API_VERSION", "v1")
-_CAL_BASE_URL = os.getenv("CAL_BASE_URL", "https://api.cal.com")
 
 _INDIA_TZ = timezone(timedelta(hours=5, minutes=30))  # Asia/Kolkata
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
 
 
 def _tomorrow() -> str:
@@ -59,60 +33,36 @@ def _tomorrow() -> str:
     return (datetime.now(_INDIA_TZ) + timedelta(days=1)).strftime("%Y-%m-%d")
 
 
-def _iso_day_bounds(day_iso: str) -> tuple[str, str]:
-    """Return (date_from, date_to) ISO strings for a full day in IST."""
-    dt = datetime.strptime(day_iso, "%Y-%m-%d").replace(tzinfo=_INDIA_TZ)
-    start = dt.isoformat()
-    end = (dt + timedelta(days=1)).isoformat()
-    return start, end
+def _default_slots(day_iso: str) -> List[str]:
+    """Return default availability slots for a given day.
+
+    Cal.com v2 ``/slots`` endpoint is not available for legacy ``cal_live_*``
+    API keys, so we return sensible business-hour defaults. If a chosen slot
+    is actually booked, ``create_booking`` will fail gracefully and the agent
+    can offer the next one.
+    """
+    # Standard coaching slots in IST: 10:00, 14:00, 16:00, 18:00
+    slot_hours = [10, 14, 16, 18]
+    slots: List[str] = []
+    for hour in slot_hours:
+        dt = datetime.strptime(day_iso, "%Y-%m-%d").replace(
+            hour=hour, minute=0, second=0, tzinfo=_INDIA_TZ
+        )
+        slots.append(dt.isoformat())
+    return slots
 
 
 def _http_client() -> httpx.AsyncClient:
     """Create a pre-configured ``httpx.AsyncClient`` for Cal.com calls."""
     return httpx.AsyncClient(
-        base_url=_CAL_BASE_URL,
+        base_url="https://api.cal.com",
         timeout=httpx.Timeout(15.0, connect=5.0),
         headers={
             "Content-Type": "application/json",
             "Accept": "application/json",
+            "cal-api-version": "2024-08-13",
         },
     )
-
-
-def _extract_slot_times(slots_payload: dict[str, Any]) -> list[str]:
-    """Extract available slot start times from a Cal.com availability response.
-
-    Cal.com v1 returns something like::
-
-        {
-          "slots": {
-            "2024-01-15": [
-              {"time": "2024-01-15T10:00:00.000Z"},
-              {"time": "2024-01-15T10:30:00.000Z"}
-            ]
-          }
-        }
-
-    We flatten the per-date lists and return ISO-8601 strings.
-    """
-    results: list[str] = []
-    slots_by_date = slots_payload.get("slots") or {}
-    if isinstance(slots_by_date, dict):
-        for _day, slot_list in slots_by_date.items():
-            if isinstance(slot_list, list):
-                for slot in slot_list:
-                    if isinstance(slot, dict):
-                        time_val = slot.get("time")
-                        if time_val:
-                            results.append(str(time_val))
-    elif isinstance(slots_by_date, list):
-        # Some API versions return a flat list
-        for slot in slots_by_date:
-            if isinstance(slot, dict):
-                time_val = slot.get("time")
-                if time_val:
-                    results.append(str(time_val))
-    return results
 
 
 # ---------------------------------------------------------------------------
@@ -121,63 +71,29 @@ def _extract_slot_times(slots_payload: dict[str, Any]) -> list[str]:
 
 
 async def check_availability(
-    date: str | None = None,
+    day: str | None = None,
     duration: int = 30,
 ) -> list[str]:
-    """Check Cal.com availability for a given date.
+    """Return available slots for a given day.
 
     Args:
-        date: ISO-8601 date string (YYYY-MM-DD). If ``None``, uses tomorrow.
+        day: ISO-8601 date string (YYYY-MM-DD). If ``None``, uses tomorrow.
         duration: Desired session length in minutes (default 30).
 
     Returns:
         A list of available slot start times in ISO-8601 format.
-        Returns an empty list on API errors or when no slots are found.
-
-    Example::
-
-        slots = await check_availability("2024-01-15")
-        # ["2024-01-15T04:30:00.000Z", "2024-01-15T05:00:00.000Z", ...]
     """
-    if not _CAL_API_KEY or not _CAL_EVENT_TYPE_ID:
-        logger.error("Cal.com not configured — CAL_API_KEY or CAL_EVENT_TYPE_ID missing")
+    settings = get_settings()
+    if not settings.CAL_API_KEY or not settings.CAL_USERNAME:
+        logger.error("Cal.com not configured — CAL_API_KEY or CAL_USERNAME missing")
         return []
 
-    target_date = date or _tomorrow()
-    date_from, date_to = _iso_day_bounds(target_date)
+    target_day = day or _tomorrow()
 
-    params = {
-        "apiKey": _CAL_API_KEY,
-        "eventTypeId": _CAL_EVENT_TYPE_ID,
-        "dateFrom": date_from,
-        "dateTo": date_to,
-        "duration": duration,
-    }
-
-    async with _http_client() as client:
-        try:
-            resp = await client.get(
-                f"/api/{_CAL_API_VERSION}/availability",
-                params=params,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except httpx.HTTPStatusError as exc:
-            logger.error(
-                "Cal.com availability HTTP %s: %s",
-                exc.response.status_code,
-                exc.response.text[:200],
-            )
-            return []
-        except httpx.RequestError as exc:
-            logger.error("Cal.com availability network error: %s", exc)
-            return []
-        except Exception as exc:
-            logger.error("Cal.com availability unexpected error: %s", exc)
-            return []
-
-    slots = _extract_slot_times(data)
-    logger.info("Found %d available slots for %s", len(slots), target_date)
+    # NOTE: Cal.com v2 /slots endpoint returns 404 for legacy cal_live_* keys.
+    # We return sensible defaults and let create_booking handle conflicts.
+    slots = _default_slots(target_day)
+    logger.info("Returning %d default slots for %s", len(slots), target_day)
     return slots
 
 
@@ -188,7 +104,7 @@ async def create_booking(
     phone: str = "",
     notes: str = "",
 ) -> dict[str, Any]:
-    """Create a new booking on Cal.com.
+    """Create a new booking on Cal.com via API v2.
 
     Args:
         name: Attendee's full name.
@@ -198,35 +114,25 @@ async def create_booking(
         notes: Optional notes / questions from the attendee.
 
     Returns:
-        The full JSON response from Cal.com (includes ``uid``, ``bookingUid``,
-        confirmation link, etc.). On failure, returns a dict with
+        The full JSON response from Cal.com. On failure, returns a dict with
         ``{"error": "...", "success": False}``.
-
-    Example::
-
-        result = await create_booking(
-            name="Rahul Sharma",
-            email="rahul@example.com",
-            start_time="2024-01-15T10:00:00+05:30",
-            phone="+919999999999",
-            notes="Interested in executive coaching",
-        )
-        # result["bookingUid"] → unique booking ID
-        # result["bookingLink"] → confirmation URL
     """
-    if not _CAL_API_KEY or not _CAL_EVENT_TYPE_ID:
-        logger.error("Cal.com not configured — CAL_API_KEY or CAL_EVENT_TYPE_ID missing")
+    settings = get_settings()
+    if not settings.CAL_API_KEY or not settings.CAL_USERNAME or not settings.CAL_EVENT_SLUG:
+        logger.error("Cal.com not configured — missing CAL_API_KEY, CAL_USERNAME or CAL_EVENT_SLUG")
         return {"error": "Cal.com not configured", "success": False}
 
     payload = {
-        "eventTypeId": _CAL_EVENT_TYPE_ID,
+        "eventTypeSlug": settings.CAL_EVENT_SLUG,
+        "username": settings.CAL_USERNAME,
         "start": start_time,
-        "timeZone": "Asia/Kolkata",
-        "language": "en",
-        "responses": {
+        "attendee": {
             "name": name,
             "email": email,
+            "timeZone": "Asia/Kolkata",
             "phone": phone,
+        },
+        "bookingFieldsResponses": {
             "notes": notes or "Booked via AI Phone Agent",
         },
         "metadata": {
@@ -238,9 +144,9 @@ async def create_booking(
     async with _http_client() as client:
         try:
             resp = await client.post(
-                f"/api/{_CAL_API_VERSION}/bookings",
+                "/v2/bookings",
                 json=payload,
-                headers={"Authorization": f"Bearer {_CAL_API_KEY}"},
+                headers={"Authorization": f"Bearer {settings.CAL_API_KEY}"},
             )
             resp.raise_for_status()
             data = resp.json()
@@ -273,21 +179,6 @@ def format_slots_for_tts(slots: list[str]) -> str:
     * **Three+ slots** → Oxford-comma list with "and" before the last item.
 
     All times are converted to **12-hour AM/PM** format in **IST** for the caller.
-
-    Args:
-        slots: List of ISO-8601 datetime strings (UTC or offset-aware).
-
-    Returns:
-        A natural-language string ready for text-to-speech synthesis.
-
-    Example::
-
-        speech = format_slots_for_tts([
-            "2024-01-15T04:30:00.000Z",
-            "2024-01-15T08:30:00.000Z",
-            "2024-01-15T10:30:00.000Z",
-        ])
-        # "I have slots at 10:00 AM, 2:00 PM, and 4:00 PM. Which works for you?"
     """
     if not slots:
         return (
@@ -349,14 +240,9 @@ async def cancel_booking(booking_uid: str) -> bool:
 
     Returns:
         ``True`` if cancellation succeeded, ``False`` otherwise.
-
-    Example::
-
-        ok = await cancel_booking("abc123-def456")
-        if ok:
-            print("Booking cancelled successfully")
     """
-    if not _CAL_API_KEY:
+    settings = get_settings()
+    if not settings.CAL_API_KEY:
         logger.error("Cal.com not configured — CAL_API_KEY missing")
         return False
 
@@ -364,23 +250,16 @@ async def cancel_booking(booking_uid: str) -> bool:
         logger.warning("cancel_booking called with empty booking_uid")
         return False
 
-    payload = {
-        "apiKey": _CAL_API_KEY,
-        "uid": booking_uid,
-        "reason": "Cancelled via AI Phone Agent",
-    }
-
     async with _http_client() as client:
         try:
             resp = await client.post(
-                f"/api/{_CAL_API_VERSION}/bookings/{booking_uid}/cancel",
-                json=payload,
-                headers={"Authorization": f"Bearer {_CAL_API_KEY}"},
+                f"/v2/bookings/{booking_uid}/cancel",
+                json={"cancellationReason": "Cancelled via AI Phone Agent"},
+                headers={"Authorization": f"Bearer {settings.CAL_API_KEY}"},
             )
             if resp.status_code in (200, 202, 204):
                 logger.info("Booking %s cancelled successfully", booking_uid)
                 return True
-            # Some Cal.com versions return 409/404 for already-cancelled or not-found
             if resp.status_code == 404:
                 logger.warning("Booking %s not found (may already be cancelled)", booking_uid)
                 return False
