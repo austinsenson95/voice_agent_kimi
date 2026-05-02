@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import base64
 import logging
-from typing import Optional
+from typing import Optional, Dict
 
 import httpx
 
@@ -55,7 +55,7 @@ async def sarvam_stt(audio_url: str, download_headers: Optional[Dict[str, str]] 
 
     # --- Step 1: Download audio from Vobiz ---
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             logger.debug("Downloading audio from %s", audio_url)
             audio_resp = await client.get(audio_url, headers=download_headers)
             audio_resp.raise_for_status()
@@ -77,7 +77,7 @@ async def sarvam_stt(audio_url: str, download_headers: Optional[Dict[str, str]] 
 
     # --- Step 2: Send to Sarvam STT ---
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
+        async with httpx.AsyncClient(timeout=15.0) as client:
             # Sarvam expects multipart/form-data with the audio file
             files = {
                 "file": ("recording.wav", audio_bytes, "audio/wav"),
@@ -132,9 +132,30 @@ async def sarvam_stt(audio_url: str, download_headers: Optional[Dict[str, str]] 
 # TTS: Text-to-Speech
 # ---------------------------------------------------------------------------
 
+def _add_prosody(text: str) -> str:
+    """Inject SSML pauses and breaks for more natural speech.
+
+    Adds:
+        - 600ms pause after questions
+        - 400ms pause after statements
+        - Slight pacing between clauses
+    """
+    import re
+
+    # Add breaks after sentence-ending punctuation
+    text = re.sub(r"\?\s+", "?<break time='600ms'/> ", text)
+    text = re.sub(r"!\s+", "!<break time='500ms'/> ", text)
+    text = re.sub(r"\.\s+(?=[A-Z])", ".<break time='400ms'/> ", text)
+
+    # Add subtle pause after commas in longer sentences
+    if len(text) > 120:
+        text = re.sub(r",\s+", ",<break time='200ms'/> ", text, count=3)
+
+    return text
+
+
 async def sarvam_tts(text: str) -> Optional[bytes]:
-    # TODO: integrate VOICE_PERSONA context constant for prosody / TTS parameters
-    """Convert text to speech using Sarvam TTS (bulbul:v1).
+    """Convert text to speech using Sarvam TTS (bulbul:v2).
 
     Args:
         text: The AI response text to speak. Keep under 500 chars
@@ -157,21 +178,26 @@ async def sarvam_tts(text: str) -> Optional[bytes]:
         return None
 
     # Truncate long text to avoid API limits and reduce latency.
-    # In production, chunking + streaming would be better for long responses.
-    MAX_CHARS = 500
-    if len(text) > MAX_CHARS:
+    MAX_SPOKEN_CHARS = 500
+    if len(text) > MAX_SPOKEN_CHARS:
         logger.warning(
-            "TTS text truncated from %d to %d chars", len(text), MAX_CHARS
+            "TTS text truncated from %d to %d chars", len(text), MAX_SPOKEN_CHARS
         )
-        text = text[:MAX_CHARS]
+        cut = text.rfind(".", 0, MAX_SPOKEN_CHARS)
+        if cut == -1:
+            cut = text.rfind(" ", 0, MAX_SPOKEN_CHARS)
+        if cut > 0:
+            text = text[:cut + 1]
+        else:
+            text = text[:MAX_SPOKEN_CHARS]
 
     payload = {
         "inputs": [text],
-        "target_language_code": settings.AGENT_LANGUAGE,  # e.g. "en-IN"
-        "speaker": "arya",  # Indian English female voice
+        "target_language_code": settings.AGENT_LANGUAGE,
+        "speaker": "anushka",
         "model": "bulbul:v2",
-        "pitch": 0.0,
-        "pace": 1.0,
+        "pitch": 0.1,
+        "pace": 0.85,
         "loudness": 1.0,
     }
     headers = {
@@ -180,7 +206,7 @@ async def sarvam_tts(text: str) -> Optional[bytes]:
     }
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             logger.debug("Sending TTS request for %d chars", len(text))
             resp = await client.post(
                 f"{base_url}/text-to-speech",
@@ -190,7 +216,6 @@ async def sarvam_tts(text: str) -> Optional[bytes]:
             resp.raise_for_status()
             result = resp.json()
 
-            # Sarvam returns base64-encoded audio
             audios = result.get("audios", [])
             if audios and len(audios) > 0:
                 audio_b64 = audios[0]
@@ -216,3 +241,92 @@ async def sarvam_tts(text: str) -> Optional[bytes]:
     except Exception as exc:
         logger.error("Unexpected error in Sarvam TTS: %s", exc)
         return None
+
+
+async def smallest_tts(text: str) -> Optional[bytes]:
+    """Convert text to speech using smallest.ai Waves Lightning (~100ms TTFB).
+
+    This is a lower-latency alternative to Sarvam TTS.
+    To enable, set SMALLEST_API_KEY in your environment.
+
+    Args:
+        text: The AI response text to speak.
+
+    Returns:
+        Raw audio bytes (WAV) or None on failure.
+    """
+    import os
+    api_key = os.getenv("SMALLEST_API_KEY", "")
+    if not api_key:
+        logger.debug("SMALLEST_API_KEY not set — skipping smallest.ai TTS")
+        return None
+
+    if not text or not text.strip():
+        return None
+
+    # Truncate
+    if len(text) > 500:
+        cut = text.rfind(".", 0, 500)
+        if cut == -1:
+            cut = text.rfind(" ", 0, 500)
+        text = text[:cut + 1] if cut > 0 else text[:500]
+
+    payload = {
+        "voice_id": "emily",  # valid smallest.ai voice (lightning v1)
+        "speed": 1.0,
+        "sample_rate": 24000,
+        "text": text,
+        "add_wav_header": True,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            logger.debug("Sending smallest.ai TTS request for %d chars", len(text))
+            resp = await client.post(
+                "https://waves-api.smallest.ai/api/v1/lightning/get_speech",
+                headers=headers,
+                json=payload,
+            )
+            resp.raise_for_status()
+            audio_bytes = resp.content
+            logger.debug(
+                "smallest.ai TTS succeeded: %d bytes of audio", len(audio_bytes)
+            )
+            return audio_bytes
+
+    except httpx.HTTPStatusError as exc:
+        logger.error(
+            "smallest.ai TTS error: HTTP %d — %s",
+            exc.response.status_code,
+            exc.response.text[:200],
+        )
+        return None
+    except httpx.TimeoutException:
+        logger.error("smallest.ai TTS timed out")
+        return None
+    except Exception as exc:
+        logger.error("Unexpected error in smallest.ai TTS: %s", exc)
+        return None
+
+
+async def generate_tts(text: str) -> Optional[bytes]:
+    """Generate TTS audio using the fastest available provider.
+
+    Priority:
+        1. smallest.ai (~100ms TTFB) if SMALLEST_API_KEY is set
+        2. Sarvam (~2-3s TTFB) fallback
+
+    Returns:
+        Audio bytes or None on failure.
+    """
+    # Try smallest.ai first (lowest latency)
+    audio = await smallest_tts(text)
+    if audio:
+        return audio
+
+    # Fallback to Sarvam
+    return await sarvam_tts(text)

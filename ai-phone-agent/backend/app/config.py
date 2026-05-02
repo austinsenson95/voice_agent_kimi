@@ -81,6 +81,12 @@ class Settings:
     DEEPSEEK_TEMPERATURE: float = float(os.getenv("DEEPSEEK_TEMPERATURE", "0.7"))
     DEEPSEEK_MAX_TOKENS: int = int(os.getenv("DEEPSEEK_MAX_TOKENS", "512"))
 
+    # --- xAI Grok ---
+    XAI_API_KEY: str = os.getenv("XAI_API_KEY", "")
+    XAI_MODEL: str = os.getenv("XAI_MODEL", "grok-2-1212")
+    XAI_TEMPERATURE: float = float(os.getenv("XAI_TEMPERATURE", "0.7"))
+    XAI_MAX_TOKENS: int = int(os.getenv("XAI_MAX_TOKENS", "150"))
+
     # --- Redis ---
     REDIS_URL: Optional[str] = os.getenv("REDIS_URL") or None
     SESSION_TTL_SECONDS: int = int(os.getenv("SESSION_TTL_SECONDS", "86400"))
@@ -141,8 +147,16 @@ class Settings:
                 "base_url": "https://api.deepseek.com/v1",
                 "timeout_seconds": 30,
             },
+            "xai": {
+                "api_key": self.XAI_API_KEY,
+                "model": self.XAI_MODEL,
+                "temperature": self.XAI_TEMPERATURE,
+                "max_tokens": self.XAI_MAX_TOKENS,
+                "base_url": "https://api.x.ai/v1",
+                "timeout_seconds": 10,
+            },
         }
-        return configs.get(provider_name, configs["anthropic"])
+        return configs.get(provider_name, configs.get("anthropic", configs["xai"]))
 
 
 @lru_cache()
@@ -217,6 +231,15 @@ _enforce_no_demo_in_production()
 # Outbound call routing guard
 # ---------------------------------------------------------------------------
 
+def _normalize_phone(phone: str) -> str:
+    """Strip formatting chars for comparison."""
+    return phone.strip().replace(" ", "").replace("-", "").lstrip("+")
+
+
+# Pre-normalize whitelist for fast comparison
+_NORMALIZED_WHITELIST = {_normalize_phone(n) for n in DEMO_WHITELIST_NUMBERS}
+
+
 def can_call(phone_number: str) -> tuple[bool, str]:
     """Return whether the agent is allowed to call *phone_number*.
 
@@ -224,7 +247,7 @@ def can_call(phone_number: str) -> tuple[bool, str]:
     In production, additional checks (DNC, consent) should be added.
     """
     if DEMO_MODE:
-        if phone_number not in DEMO_WHITELIST_NUMBERS:
+        if _normalize_phone(phone_number) not in _NORMALIZED_WHITELIST:
             return False, f"DEMO_MODE: {phone_number} not in whitelist"
         return True, "DEMO_MODE: whitelisted"
     # Production checks: DNC list, consent records, etc.

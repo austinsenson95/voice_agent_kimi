@@ -535,6 +535,134 @@ class AnthropicProvider(LLMProvider):
 # DeepSeek Provider
 # ---------------------------------------------------------------------------
 
+class XAIProvider(LLMProvider):
+    """xAI Grok provider using OpenAI-compatible API.
+
+    Grok offers fast inference with strong instruction following.
+    Uses the same message format as OpenAI.
+    """
+
+    def __init__(self) -> None:
+        settings = get_settings()
+        cfg = settings.provider_config("xai")
+        self._api_key = cfg["api_key"]
+        self._model = cfg["model"]
+        self._temperature = cfg["temperature"]
+        self._max_tokens = cfg["max_tokens"]
+        self._base_url = cfg["base_url"]
+        self._timeout = cfg["timeout_seconds"]
+
+    @property
+    def name(self) -> str:
+        return "xai"
+
+    @property
+    def model(self) -> str:
+        return self._model
+
+    async def generate(
+        self,
+        messages: List[Dict[str, str]],
+        system: Optional[str] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+    ) -> LLMResponse:
+        if not self._api_key:
+            return LLMResponse(
+                text="xAI is not configured. Please set XAI_API_KEY.",
+                provider=self.name,
+                model=self.model,
+                error="XAI_API_KEY not set",
+            )
+
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+
+        api_messages: List[Dict[str, str]] = []
+        if system:
+            api_messages.append({"role": "system", "content": system})
+        api_messages.extend(messages)
+
+        payload: Dict[str, Any] = {
+            "model": self._model,
+            "messages": api_messages,
+            "temperature": self._temperature,
+            "max_tokens": self._max_tokens,
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+
+        start_time = time.monotonic()
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                resp = await client.post(
+                    f"{self._base_url}/chat/completions",
+                    headers=headers,
+                    json=payload,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+        except httpx.HTTPStatusError as exc:
+            latency_ms = int((time.monotonic() - start_time) * 1000)
+            return LLMResponse(
+                text="Service temporarily unavailable.",
+                provider=self.name,
+                model=self.model,
+                latency_ms=latency_ms,
+                error=f"HTTP {exc.response.status_code}: {exc.response.text[:200]}",
+            )
+        except httpx.TimeoutException:
+            latency_ms = int((time.monotonic() - start_time) * 1000)
+            return LLMResponse(
+                text="Request timed out.",
+                provider=self.name,
+                model=self.model,
+                latency_ms=latency_ms,
+                error="Request timed out",
+            )
+        except Exception as exc:
+            latency_ms = int((time.monotonic() - start_time) * 1000)
+            return LLMResponse(
+                text="An error occurred.",
+                provider=self.name,
+                model=self.model,
+                latency_ms=latency_ms,
+                error=str(exc)[:500],
+            )
+
+        latency_ms = int((time.monotonic() - start_time) * 1000)
+
+        try:
+            choice = data["choices"][0]
+            usage = data.get("usage", {})
+            prompt_tokens = usage.get("prompt_tokens", 0)
+            completion_tokens = usage.get("completion_tokens", 0)
+            message = choice.get("message", {})
+            text = message.get("content", "")
+
+            return LLMResponse(
+                text=text,
+                provider=self.name,
+                model=self.model,
+                latency_ms=latency_ms,
+                tokens_used=prompt_tokens + completion_tokens,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                cost_usd=self._calc_cost(prompt_tokens, completion_tokens),
+                finish_reason=choice.get("finish_reason"),
+            )
+        except (KeyError, IndexError) as exc:
+            return LLMResponse(
+                text="Unexpected response format.",
+                provider=self.name,
+                model=self.model,
+                latency_ms=latency_ms,
+                error=f"Malformed response: {str(exc)[:200]}",
+            )
+
+
 class DeepSeekProvider(LLMProvider):
     """DeepSeek provider using OpenAI-compatible API.
 
@@ -709,9 +837,10 @@ def get_llm_provider(provider_name: Optional[str] = None) -> LLMProvider:
         "openai": OpenAIProvider,
         "anthropic": AnthropicProvider,
         "deepseek": DeepSeekProvider,
+        "xai": XAIProvider,
     }
 
-    provider_class = providers.get(provider_name, GroqProvider)
+    provider_class = providers.get(provider_name, XAIProvider)
     _provider_instance = provider_class()
     return _provider_instance
 
