@@ -19,7 +19,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from app.config import get_settings
+from app.config import get_settings, MEMORY_SCHEMA
 from app.schemas import Turn
 
 logger = logging.getLogger(__name__)
@@ -81,6 +81,7 @@ class SessionMemory:
     """
 
     def __init__(self) -> None:
+        # TODO: integrate MEMORY_SCHEMA context constant for schema validation
         settings = get_settings()
         redis_url = settings.REDIS_URL
         self._ttl = settings.SESSION_TTL_SECONDS

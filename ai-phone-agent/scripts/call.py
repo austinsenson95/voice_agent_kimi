@@ -12,12 +12,17 @@ Usage:
     # Call a different number
     python scripts/call.py --to +919876543210
 
+    # Add a number to the demo whitelist for this session
+    python scripts/call.py --to +919876543210 --whitelist
+
 Environment:
     VOBIZ_AUTH_ID      (default: MA_B1SVPHLK)
     VOBIZ_AUTH_TOKEN
     VOBIZ_DID          (default: +918065481227)
     BACKEND_URL        (default: http://localhost:8000)
     NGROK_URL          (used for live mode webhooks)
+    DEMO_MODE          (default: true)
+    DEMO_WHITELIST_NUMBERS  (comma-separated, required in demo mode)
 """
 from __future__ import annotations
 
@@ -51,6 +56,11 @@ VOBIZ_DID = os.getenv("VOBIZ_DID", "+918065481227")
 VOBIZ_BASE_URL = os.getenv("VOBIZ_BASE_URL", "https://api.vobiz.ai/api/v1")
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 NGROK_URL = os.getenv("NGROK_URL", "")
+
+DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() == "true"
+DEMO_WHITELIST = set(
+    n.strip() for n in os.getenv("DEMO_WHITELIST_NUMBERS", "").split(",") if n.strip()
+)
 
 DEFAULT_TO_NUMBER = "+918301877184"
 
@@ -109,7 +119,6 @@ def _play_audio(url: str) -> None:
     system = platform.system()
     try:
         if system == "Darwin":  # macOS
-            # Download to temp file first (afplay works better with local files)
             tmp_path = "/tmp/phone_agent_last_response.wav"
             httpx.get(url).raise_for_status()
             with open(tmp_path, "wb") as f:
@@ -123,6 +132,38 @@ def _play_audio(url: str) -> None:
             print(f"  🔊  Audio: {url}")
     except Exception as exc:
         print(f"  🔊  Audio: {url} (could not play: {exc})")
+
+
+def _check_backend() -> dict:
+    """Ping the backend health endpoint and return status info."""
+    try:
+        r = httpx.get(f"{BACKEND_URL}/health", timeout=5)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return {}
+
+
+def _show_demo_banner() -> None:
+    """Print demo-mode banner if active."""
+    if DEMO_MODE:
+        print(
+            """
+╔══════════════════════════════════════════════════════════════╗
+║  [DEMO MODE]  Test calls only — whitelisted numbers only     ║
+║  Whitelist: {count} number(s)                                  ║
+╚══════════════════════════════════════════════════════════════╝
+""".format(count=len(DEMO_WHITELIST))
+        )
+
+
+def _is_whitelisted(phone: str) -> bool:
+    """Check if a number is in the demo whitelist."""
+    if not DEMO_MODE:
+        return True
+    clean = phone.strip().replace(" ", "").replace("-", "")
+    return clean in DEMO_WHITELIST
 
 
 # ---------------------------------------------------------------------------
@@ -144,8 +185,21 @@ def _get_ngrok_url() -> Optional[str]:
     return None
 
 
-def start_live_call(to_number: str) -> Optional[str]:
+def start_live_call(to_number: str, auto_whitelist: bool = False) -> Optional[str]:
     """Initiate an outbound call via Vobiz. Returns call_sid or None."""
+    _show_demo_banner()
+
+    # Demo-mode whitelist check
+    if DEMO_MODE and not _is_whitelisted(to_number):
+        if auto_whitelist:
+            DEMO_WHITELIST.add(to_number.strip().replace(" ", "").replace("-", ""))
+            print(f"✅  Added {to_number} to demo whitelist for this session.")
+        else:
+            print(f"❌  DEMO_MODE: {to_number} is NOT in the whitelist.")
+            print(f"   Whitelisted: {', '.join(DEMO_WHITELIST) or '(none)'}")
+            print("   Run with --whitelist to auto-add, or set DEMO_WHITELIST_NUMBERS in .env")
+            return None
+
     if not VOBIZ_AUTH_TOKEN:
         print("❌  VOBIZ_AUTH_TOKEN not set. Export it and try again.")
         return None
@@ -243,7 +297,6 @@ def monitor_live_call(call_sid: Optional[str]) -> None:
 
     except KeyboardInterrupt:
         print("\n🛑  Stopped monitoring.")
-        # Optionally send hangup webhook to clean up
         try:
             httpx.post(
                 f"{BACKEND_URL}/webhook/vobiz/hangup",
@@ -262,6 +315,15 @@ def monitor_live_call(call_sid: Optional[str]) -> None:
 def run_simulation() -> None:
     """Run a fully local conversation loop against the backend webhooks."""
     call_sid = f"sim-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+
+    _show_demo_banner()
+
+    # Check backend health
+    health = _check_backend()
+    if health:
+        print(f"   Backend: {health.get('status', 'unknown')} | Mode: {health.get('mode', 'unknown')}")
+    else:
+        print("   ⚠️  Backend not reachable. Start it with: cd backend && python run.py")
 
     print("=" * 60)
     print("🧪  SIMULATION MODE — No real phone call")
@@ -394,12 +456,17 @@ def main() -> None:
         action="store_true",
         help="Monitor the call after initiating (live mode only)",
     )
+    parser.add_argument(
+        "--whitelist", "-w",
+        action="store_true",
+        help="Auto-add --to number to demo whitelist for this session",
+    )
     args = parser.parse_args()
 
     if args.simulate:
         run_simulation()
     else:
-        call_sid = start_live_call(args.to)
+        call_sid = start_live_call(args.to, auto_whitelist=args.whitelist)
         if call_sid and args.monitor:
             monitor_live_call(call_sid)
         elif call_sid:

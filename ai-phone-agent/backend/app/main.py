@@ -42,7 +42,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-from app.config import get_settings
+from app.config import get_settings, startup_banner
 from app.llm_provider import get_llm_provider, reset_provider
 from app.memory import SessionMemory
 from app.schemas import (
@@ -55,7 +55,8 @@ from app.schemas import (
 
     WebhookResponse,
 )
-from app.state_machine import build_system_prompt, determine_next_state
+from app.config import build_system_prompt
+from app.state_machine import determine_next_state
 from app.voice_pipeline import sarvam_stt, sarvam_tts
 
 # Integration modules
@@ -100,6 +101,7 @@ _APP_START_TIME = time.monotonic()
 async def lifespan(app: FastAPI):
     """Application lifespan handler -- runs on startup and shutdown."""
     # Startup
+    startup_banner()
     logger.info("=" * 50)
     logger.info("AI Phone Agent starting up")
     logger.info("LLM Provider: %s", get_settings().LLM_PROVIDER)
@@ -398,7 +400,11 @@ async def webhook_answer(request: Request):
     # --- 2. Return INSTANT greeting (skip slow LLM+TTS to avoid Vobiz timeout) ---
     # The recording webhook will handle LLM+TTS for subsequent turns.
     settings = get_settings()
-    greeting = f"Hello! This is {settings.BUSINESS_NAME or 'your coaching assistant'}. How can I help you today?"
+    greeting = (
+        "Hey, this is Aisha from Hamza's team. I'm reaching out because "
+        "you recently showed interest in building a freedom business. "
+        "Do you have two minutes to chat?"
+    )
     await _memory.add_turn(call_sid, "assistant", greeting)
 
     logger.info("[call:%s] Sent instant greeting (bypass LLM/TTS for answer webhook)", call_sid)
@@ -500,7 +506,12 @@ async def webhook_recording(request: Request):
 
     # --- 5. Build system prompt ---
     settings = get_settings()
-    system_prompt = build_system_prompt(next_state, settings.BATTLE_CARD_TEXT or "")
+    lead_memory = {
+        "call_sid": call_sid,
+        "state": next_state,
+        "from_number": session.get("from_number", "unknown"),
+    }
+    system_prompt = build_system_prompt(next_state, lead_memory)
 
     # --- 6. Get conversation history and call LLM ---
     turns = await _memory.get_turns(call_sid, last_n=10)
@@ -521,7 +532,7 @@ async def webhook_recording(request: Request):
             media_type="application/xml",
         )
 
-    ai_text = llm_resp.text or "Main samajh nahi paaya. Kripya dobara boliye."
+    ai_text = llm_resp.text or "I'm sorry, I didn't catch that. Could you say that again?"
 
     # --- 7. Add AI turn ---
     await _memory.add_turn(call_sid, "assistant", ai_text)

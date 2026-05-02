@@ -25,6 +25,7 @@ from app.objections import (
     get_all_objections,
     should_escalate,
 )
+from app.config import BATTLE_CARD
 
 logger = logging.getLogger(__name__)
 
@@ -240,6 +241,7 @@ class BattleCard:
         return response
 
     def format_for_llm(self, state: str = "OPENING") -> str:
+        # TODO: integrate BATTLE_CARD context constant into prompt assembly
         """Combine business context, state instructions, and objection guide.
 
         This is the **primary entry-point** for generating the LLM system prompt.

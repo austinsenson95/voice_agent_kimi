@@ -5,8 +5,14 @@ Uses pydantic-settings to load configuration from environment variables
 with sensible defaults. Falls back to .env file for local development.
 """
 
+from __future__ import annotations
+
+import json
 import os
+import re
+import sys
 from functools import lru_cache
+from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -14,6 +20,16 @@ from dotenv import load_dotenv
 # Load .env file if present (for local development)
 # In production, env vars should be injected by the deployment platform
 load_dotenv()
+
+
+# ---------------------------------------------------------------------------
+# DEMO_MODE control
+# ---------------------------------------------------------------------------
+
+DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() == "true"
+DEMO_WHITELIST_NUMBERS = set(
+    n.strip() for n in os.getenv("DEMO_WHITELIST_NUMBERS", "").split(",") if n.strip()
+)
 
 
 class Settings:
@@ -137,3 +153,203 @@ def get_settings() -> Settings:
     avoiding repeated os.getenv overhead on every request.
     """
     return Settings()
+
+
+# ---------------------------------------------------------------------------
+# Context layer — per-module markdown files loaded once at import
+# ---------------------------------------------------------------------------
+
+CONTEXT_DIR = Path(__file__).parent.parent / "context"
+
+PERSONA = (CONTEXT_DIR / "persona.md").read_text()
+BATTLE_CARD = (CONTEXT_DIR / "battle_card.md").read_text()
+OBJECTIONS = (CONTEXT_DIR / "objections.md").read_text()
+STATE_PROMPTS = (CONTEXT_DIR / "state_prompts.md").read_text()
+MEMORY_SCHEMA = (CONTEXT_DIR / "memory_schema.md").read_text()
+VOICE_PERSONA = (CONTEXT_DIR / "voice_persona.md").read_text()
+WHATSAPP_PERSONA = (CONTEXT_DIR / "whatsapp_persona.md").read_text()
+CALENDAR_RULES = (CONTEXT_DIR / "calendar_rules.md").read_text()
+COMPLIANCE = (CONTEXT_DIR / "compliance.md").read_text()
+EVAL_CASES = (CONTEXT_DIR / "eval_cases.md").read_text()
+
+with open(CONTEXT_DIR / "banned_phrases.json") as _f:
+    BANNED_PHRASES = json.load(_f)
+BANNED_FLAT = [p for cat in BANNED_PHRASES.values() for p in cat]
+
+# Language policy
+LANGUAGE_POLICY_INSTRUCTION = (
+    "Respond in English only. Do not use Hindi, Hinglish, transliteration, "
+    "or any other language. If the lead speaks another language, follow "
+    "the language-switch script in the persona."
+)
+
+# Non-Latin script regex (Devanagari, Tamil, Telugu, Bengali)
+NON_ENGLISH_SCRIPT_PATTERN = re.compile(
+    r"[\u0900-\u097F\u0B80-\u0BFF\u0C00-\u0C7F\u0980-\u09FF]"
+)
+
+
+# ---------------------------------------------------------------------------
+# Production-mode demo-tag guard
+# ---------------------------------------------------------------------------
+
+def _enforce_no_demo_in_production() -> None:
+    if DEMO_MODE:
+        return
+    offenders = []
+    for md_file in CONTEXT_DIR.glob("*.md"):
+        text = md_file.read_text()
+        if "[DEMO:" in text:
+            offenders.append(str(md_file.name))
+    if offenders:
+        print(
+            "FATAL: DEMO_MODE=false but [DEMO:] tags still present in context files:\n  "
+            + "\n  ".join(offenders),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+_enforce_no_demo_in_production()
+
+
+# ---------------------------------------------------------------------------
+# Outbound call routing guard
+# ---------------------------------------------------------------------------
+
+def can_call(phone_number: str) -> tuple[bool, str]:
+    """Return whether the agent is allowed to call *phone_number*.
+
+    In DEMO_MODE, only whitelisted numbers are permitted.
+    In production, additional checks (DNC, consent) should be added.
+    """
+    if DEMO_MODE:
+        if phone_number not in DEMO_WHITELIST_NUMBERS:
+            return False, f"DEMO_MODE: {phone_number} not in whitelist"
+        return True, "DEMO_MODE: whitelisted"
+    # Production checks: DNC list, consent records, etc.
+    return True, "PRODUCTION"
+
+
+# ---------------------------------------------------------------------------
+# System prompt builder
+# ---------------------------------------------------------------------------
+
+def _format_memory(lead_memory: dict) -> str:
+    """Format lead memory dict into a string for system prompts."""
+    if not lead_memory:
+        return "No prior lead context available."
+    lines = ["## LEAD CONTEXT"]
+    for key, value in lead_memory.items():
+        lines.append(f"- {key}: {value}")
+    return "\n".join(lines)
+
+
+def _extract_state_block(state_prompts_text: str, state: str) -> str:
+    """Extract the prompt block for a specific state from state_prompts.md.
+
+    Looks for a heading like ``## STATE: DISCOVERY`` and returns everything
+    until the next ``## STATE:`` heading or the end of the file.
+    """
+    pattern = re.compile(
+        rf"^## STATE: {re.escape(state)}\b(.*?)(?=^## STATE: |\Z)",
+        re.MULTILINE | re.DOTALL,
+    )
+    match = pattern.search(state_prompts_text)
+    if match:
+        return match.group(1).strip()
+    return f"[No prompt template found for state: {state}]"
+
+
+def build_system_prompt(state: str, lead_memory: dict) -> str:
+    """Compose the full system prompt for an LLM call.
+
+    Combines persona, language policy, compliance, state-specific prompts,
+    battle card, and lead memory into a single string.
+    """
+    demo_banner = "[DEMO MODE — fabricated context, test calls only]\n\n" if DEMO_MODE else ""
+    return f"""{demo_banner}{PERSONA}
+
+{LANGUAGE_POLICY_INSTRUCTION}
+
+{COMPLIANCE}
+
+CURRENT STATE: {state}
+{_extract_state_block(STATE_PROMPTS, state)}
+
+RELEVANT BATTLE CARD:
+{BATTLE_CARD}
+
+{_format_memory(lead_memory)}
+"""
+
+
+def build_objection_prompt(objection_text: str, lead_memory: dict) -> str:
+    """Compose a system prompt specifically for objection handling."""
+    return f"""{PERSONA}
+
+{LANGUAGE_POLICY_INSTRUCTION}
+
+OBJECTION HANDLING TASK:
+The lead just said: "{objection_text}"
+
+Respond using the Acknowledge → Reframe → Bridge → Re-engage pattern from:
+{OBJECTIONS}
+
+LEAD CONTEXT:
+{_format_memory(lead_memory)}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Output validators
+# ---------------------------------------------------------------------------
+
+def validate_response_english_only(response: str) -> tuple[bool, str]:
+    """Reject responses containing non-Latin scripts."""
+    if NON_ENGLISH_SCRIPT_PATTERN.search(response):
+        return False, "non_latin_script_detected"
+    return True, ""
+
+
+def validate_response_no_banned_phrases(response: str) -> tuple[bool, str]:
+    """Reject responses containing banned phrases from banned_phrases.json."""
+    lower = response.lower()
+    hits = [p for p in BANNED_FLAT if p.lower() in lower]
+    if hits:
+        return False, f"banned_phrases: {hits}"
+    return True, ""
+
+
+def validate_response(response: str) -> tuple[bool, list[str]]:
+    """Run all validators against an LLM response.
+
+    Returns:
+        (is_valid, list_of_failure_messages)
+    """
+    failures = []
+    ok1, msg1 = validate_response_english_only(response)
+    if not ok1:
+        failures.append(msg1)
+    ok2, msg2 = validate_response_no_banned_phrases(response)
+    if not ok2:
+        failures.append(msg2)
+    return (len(failures) == 0, failures)
+
+
+# ---------------------------------------------------------------------------
+# Startup banner
+# ---------------------------------------------------------------------------
+
+def startup_banner() -> None:
+    """Print a startup banner showing mode and configuration."""
+    mode = "DEMO" if DEMO_MODE else "PRODUCTION"
+    print(
+        f"""
+╔══════════════════════════════════════════════════╗
+║  voice-agent-kimi  —  Mode: {mode:<20}║
+║  Language policy: ENGLISH ONLY                   ║
+║  Whitelist: {len(DEMO_WHITELIST_NUMBERS)} number(s)                          ║
+╚══════════════════════════════════════════════════╝
+"""
+    )

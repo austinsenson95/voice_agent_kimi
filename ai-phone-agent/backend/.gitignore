@@ -1,0 +1,12 @@
+# Context source material (transcripts, audio, PII)
+context/sources/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Env files
+.env

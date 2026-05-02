@@ -20,7 +20,7 @@ from typing import Optional
 
 import httpx
 
-from app.config import get_settings
+from app.config import get_settings, VOICE_PERSONA, NON_ENGLISH_SCRIPT_PATTERN
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +133,7 @@ async def sarvam_stt(audio_url: str, download_headers: Optional[Dict[str, str]] 
 # ---------------------------------------------------------------------------
 
 async def sarvam_tts(text: str) -> Optional[bytes]:
+    # TODO: integrate VOICE_PERSONA context constant for prosody / TTS parameters
     """Convert text to speech using Sarvam TTS (bulbul:v1).
 
     Args:

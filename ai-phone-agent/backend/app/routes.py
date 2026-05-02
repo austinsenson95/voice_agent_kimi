@@ -38,6 +38,7 @@ from app.objections import (
     should_escalate,
     get_all_objections,
 )
+from app.config import can_call  # TODO: gate outbound dispatch with can_call(phone) — reject with 403 if False
 
 logger = logging.getLogger(__name__)
 

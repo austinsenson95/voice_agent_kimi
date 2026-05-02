@@ -21,7 +21,11 @@ version would use an LLM-based router or LangGraph for richer logic.
 
 from __future__ import annotations
 
-from app.config import get_settings
+from app.config import get_settings, STATE_PROMPTS
+from app.config import (
+    build_system_prompt as _config_build_system_prompt,
+    validate_response,
+)
 from app.schemas import ConversationState
 
 
@@ -209,6 +213,7 @@ _STATE_PROMPTS: dict[str, str] = {
 
 
 def build_system_prompt(state: str, battle_card_text: str) -> str:
+    # TODO: integrate STATE_PROMPTS context constant and new config.build_system_prompt
     """Build the LLM system prompt for the current conversation state.
 
     Each state has a specific instruction set that guides the LLM's

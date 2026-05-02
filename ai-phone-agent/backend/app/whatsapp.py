@@ -34,6 +34,8 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+from app.config import WHATSAPP_PERSONA  # TODO: integrate into message builders
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -158,6 +160,7 @@ async def send_followup(
     name: str = "there",
     booking_link: str = "",
 ) -> dict[str, Any]:
+    # TODO: integrate WHATSAPP_PERSONA context constant for tone/templates
     """Send a personalised follow-up message after a call ends.
 
     The message includes the business name, a warm closing, and an

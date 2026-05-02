@@ -18,6 +18,8 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+from app.config import OBJECTIONS, build_objection_prompt, validate_response  # TODO: integrate build_objection_prompt for each detected objection
+
 # ---------------------------------------------------------------------------
 # Objection Library
 # ---------------------------------------------------------------------------
@@ -273,6 +275,7 @@ def detect_objection(user_text: str) -> dict[str, Any] | None:
 
 
 def get_objection_response(objection_id: str, context: dict[str, str]) -> str:
+    # TODO: integrate OBJECTIONS context constant into response rendering
     """Render the response template for a given *objection_id*.
 
     Substitutes placeholders like ``{business_name}``, ``{owner_name}``,

@@ -17,7 +17,7 @@ from typing import Any, List
 
 import httpx
 
-from app.config import get_settings
+from app.config import get_settings, CALENDAR_RULES
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +169,7 @@ async def create_booking(
 
 
 def format_slots_for_tts(slots: list[str]) -> str:
+    # TODO: integrate CALENDAR_RULES context constant for booking language
     """Format a list of ISO-8601 slot times into natural speech for TTS.
 
     Handles edge cases elegantly:
